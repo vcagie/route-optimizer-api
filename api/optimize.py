@@ -7,7 +7,6 @@ from http.server import BaseHTTPRequestHandler
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 MAX_LOCATIONS = 10
-SOLVE_TIME_LIMIT_SECONDS = 3
 ORS_MATRIX_URL = "https://api.openrouteservice.org/v2/matrix/driving-car"
 ORS_TIMEOUT_SECONDS = 10
 
@@ -97,8 +96,6 @@ def solve_round_trip(distance_m, duration_s):
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.FromSeconds(SOLVE_TIME_LIMIT_SECONDS)
 
     solution = routing.SolveWithParameters(params)
     if solution is None:
@@ -138,8 +135,6 @@ def solve_one_way(distance_m, duration_s):
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.FromSeconds(SOLVE_TIME_LIMIT_SECONDS)
 
     solution = routing.SolveWithParameters(params)
     if solution is None:
