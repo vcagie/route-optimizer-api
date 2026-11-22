@@ -6,7 +6,12 @@ from http.server import BaseHTTPRequestHandler
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-MAX_LOCATIONS = 10
+MAX_LOCATIONS = 25
+# Held-Karp is O(n^2 * 2^n): 15 stops solves in ~0.25s in CPython, and every
+# extra stop roughly doubles that. Above the cutoff, fall back to OR-Tools with
+# a time-bounded metaheuristic search.
+EXACT_SOLVER_MAX_LOCATIONS = 15
+HEURISTIC_TIME_LIMIT_SECONDS = 2
 ORS_MATRIX_URL = "https://api.openrouteservice.org/v2/matrix/driving-car"
 ORS_TIMEOUT_SECONDS = 10
 
@@ -40,7 +45,11 @@ def fetch_distance_duration_matrix(locations):
     except urllib.error.URLError as e:
         raise RuntimeError(f"routing API unreachable: {e.reason}")
 
-    return data["distances"], data["durations"]
+    distances, durations = data["distances"], data["durations"]
+    # ORS returns null for pairs it cannot route between (e.g. across an ocean).
+    if any(v is None for row in durations for v in row):
+        raise RuntimeError("no drivable route exists between some of these stops")
+    return distances, durations
 
 
 def validate_request(body):
@@ -70,99 +79,186 @@ def validate_request(body):
         if not isinstance(lng, (int, float)) or not (-180 <= lng <= 180):
             raise ValueError(f"invalid lng for id {loc['id']}")
 
-    return mode, locations
+    start_id = body.get("start_id")
+    if start_id is None:
+        start_id = locations[0]["id"]
+    elif start_id not in seen_ids:
+        raise ValueError("start_id must match one of the location ids")
+
+    end_id = body.get("end_id")
+    if mode == "round-trip":
+        end_id = None  # a round trip always ends where it started
+    elif end_id is not None:
+        if end_id not in seen_ids:
+            raise ValueError("end_id must match one of the location ids")
+        if end_id == start_id:
+            raise ValueError("end_id must differ from start_id for a one-way route")
+
+    return mode, locations, start_id, end_id
 
 
-def sum_route_distance_m(distance_m, order_indices, close_loop):
-    total = 0.0
-    for a, b in zip(order_indices, order_indices[1:]):
-        total += distance_m[a][b]
+def route_total(matrix, order, close_loop):
+    total = sum(matrix[a][b] for a, b in zip(order, order[1:]))
     if close_loop:
-        total += distance_m[order_indices[-1]][order_indices[0]]
+        total += matrix[order[-1]][order[0]]
     return total
 
 
-def solve_round_trip(distance_m, duration_s):
-    n = len(distance_m)
+def solve_exact(cost, start, end, close_loop):
+    """Held-Karp dynamic programming: returns the provably optimal visiting order.
 
-    manager = pywrapcp.RoutingIndexManager(n, 1, 0)
-    routing = pywrapcp.RoutingModel(manager)
+    dp[mask][j] is the cheapest path that leaves `start`, visits exactly the
+    nodes in `mask`, and currently sits at node j.
+    """
+    n = len(cost)
+    inf = float("inf")
+    full = (1 << n) - 1
+    dp = [[inf] * n for _ in range(1 << n)]
+    parent = [[-1] * n for _ in range(1 << n)]
+    dp[1 << start][start] = 0.0
 
-    def duration_callback(from_index, to_index):
-        return round(duration_s[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
+    for mask in range(1 << n):
+        if not mask & (1 << start):
+            continue
+        row = dp[mask]
+        for j in range(n):
+            base = row[j]
+            if base == inf:
+                continue
+            cost_from_j = cost[j]
+            for k in range(n):
+                bit = 1 << k
+                if mask & bit:
+                    continue
+                next_mask = mask | bit
+                # A pinned end may only be entered as the very last stop.
+                if k == end and next_mask != full:
+                    continue
+                candidate = base + cost_from_j[k]
+                if candidate < dp[next_mask][k]:
+                    dp[next_mask][k] = candidate
+                    parent[next_mask][k] = j
 
-    transit_callback_index = routing.RegisterTransitCallback(duration_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    if end is not None:
+        last = end
+    else:
+        def final_cost(j):
+            return dp[full][j] + (cost[j][start] if close_loop else 0)
+        last = min((j for j in range(n) if j != start), key=final_cost)
 
-    params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-
-    solution = routing.SolveWithParameters(params)
-    if solution is None:
-        raise RuntimeError("solver failed to find a solution")
-
-    order_indices = []
-    index = routing.Start(0)
-    while not routing.IsEnd(index):
-        order_indices.append(manager.IndexToNode(index))
-        index = solution.Value(routing.NextVar(index))
-
-    total_duration_s = solution.ObjectiveValue()
-    total_distance_m = sum_route_distance_m(distance_m, order_indices, close_loop=True)
-    return order_indices, total_distance_m, total_duration_s
+    order = []
+    mask, node = full, last
+    while node != -1:
+        order.append(node)
+        prev = parent[mask][node]
+        mask &= ~(1 << node)
+        node = prev
+    order.reverse()
+    return order
 
 
-def solve_one_way(distance_m, duration_s):
-    n = len(distance_m)
+def solve_heuristic(cost, start, end, close_loop):
+    """OR-Tools routing with guided local search for routes too large to solve exactly."""
+    n = len(cost)
 
-    # Add a dummy "end" node with zero cost to/from every real node,
-    # so the solver can terminate the path at whichever real node is optimal.
-    dummy = n
-    size = n + 1
-    full_duration = [[0] * size for _ in range(size)]
+    if close_loop:
+        size = n
+        manager = pywrapcp.RoutingIndexManager(n, 1, start)
+    elif end is not None:
+        size = n
+        manager = pywrapcp.RoutingIndexManager(n, 1, [start], [end])
+    else:
+        # Add a dummy "end" node with zero cost to/from every real node,
+        # so the solver can terminate the path at whichever real node is optimal.
+        size = n + 1
+        manager = pywrapcp.RoutingIndexManager(size, 1, [start], [n])
+
+    int_cost = [[0] * size for _ in range(size)]
     for i in range(n):
         for j in range(n):
-            full_duration[i][j] = duration_s[i][j]
+            int_cost[i][j] = round(cost[i][j])
 
-    manager = pywrapcp.RoutingIndexManager(size, 1, [0], [dummy])
     routing = pywrapcp.RoutingModel(manager)
 
-    def duration_callback(from_index, to_index):
-        return round(full_duration[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
+    def cost_callback(from_index, to_index):
+        return int_cost[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
 
-    transit_callback_index = routing.RegisterTransitCallback(duration_callback)
+    transit_callback_index = routing.RegisterTransitCallback(cost_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    params.time_limit.FromSeconds(HEURISTIC_TIME_LIMIT_SECONDS)
 
     solution = routing.SolveWithParameters(params)
     if solution is None:
         raise RuntimeError("solver failed to find a solution")
 
-    order_indices = []
+    order = []
     index = routing.Start(0)
     while not routing.IsEnd(index):
-        node = manager.IndexToNode(index)
-        if node != dummy:
-            order_indices.append(node)
+        order.append(manager.IndexToNode(index))
         index = solution.Value(routing.NextVar(index))
+    if end is not None:
+        order.append(end)  # the pinned end node is the route's end index, not visited in the loop
+    return order
 
-    total_duration_s = solution.ObjectiveValue()
-    total_distance_m = sum_route_distance_m(distance_m, order_indices, close_loop=False)
-    return order_indices, total_distance_m, total_duration_s
+
+def baseline_order(n, start, end):
+    """The user's own order, adjusted only to respect the pinned start/end."""
+    order = [start] + [i for i in range(n) if i not in (start, end)]
+    if end is not None:
+        order.append(end)
+    return order
 
 
-def optimize(mode, locations):
+def build_legs(locations, order, distance_m, duration_s, close_loop):
+    pairs = list(zip(order, order[1:]))
+    if close_loop:
+        pairs.append((order[-1], order[0]))
+    return [
+        {
+            "from_id": locations[a]["id"],
+            "to_id": locations[b]["id"],
+            "distance_m": round(distance_m[a][b], 1),
+            "duration_s": round(duration_s[a][b], 1),
+        }
+        for a, b in pairs
+    ]
+
+
+def optimize(mode, locations, start_id, end_id):
     distance_m, duration_s = fetch_distance_duration_matrix(locations)
 
-    if mode == "round-trip":
-        order_indices, total_distance_m, total_duration_s = solve_round_trip(distance_m, duration_s)
-    else:
-        order_indices, total_distance_m, total_duration_s = solve_one_way(distance_m, duration_s)
+    index_of = {loc["id"]: i for i, loc in enumerate(locations)}
+    start = index_of[start_id]
+    end = index_of[end_id] if end_id is not None else None
+    close_loop = mode == "round-trip"
 
-    order_ids = [locations[i]["id"] for i in order_indices]
-    return order_ids, round(total_distance_m / 1000, 3), round(total_duration_s / 60, 2)
+    # Optimize for drive time; distance is reported alongside.
+    is_exact = len(locations) <= EXACT_SOLVER_MAX_LOCATIONS
+    solver = solve_exact if is_exact else solve_heuristic
+    order = solver(duration_s, start, end, close_loop)
+    baseline = baseline_order(len(locations), start, end)
+
+    return {
+        "mode": mode,
+        "order": [locations[i]["id"] for i in order],
+        "optimal": is_exact,
+        "solver": "held-karp" if is_exact else "or-tools-guided-local-search",
+        "total_distance_m": round(route_total(distance_m, order, close_loop), 1),
+        "total_duration_s": round(route_total(duration_s, order, close_loop), 1),
+        # Kept for backward compatibility with earlier clients.
+        "total_distance_km": round(route_total(distance_m, order, close_loop) / 1000, 3),
+        "total_duration_min": round(route_total(duration_s, order, close_loop) / 60, 2),
+        "legs": build_legs(locations, order, distance_m, duration_s, close_loop),
+        "baseline": {
+            "order": [locations[i]["id"] for i in baseline],
+            "total_distance_m": round(route_total(distance_m, baseline, close_loop), 1),
+            "total_duration_s": round(route_total(duration_s, baseline, close_loop), 1),
+        },
+    }
 
 
 class handler(BaseHTTPRequestHandler):
@@ -195,20 +291,15 @@ class handler(BaseHTTPRequestHandler):
             return
 
         try:
-            mode, locations = validate_request(body)
+            mode, locations, start_id, end_id = validate_request(body)
         except ValueError as e:
             self._send_json(400, {"error": str(e)})
             return
 
         try:
-            order, total_distance_km, total_duration_min = optimize(mode, locations)
+            result = optimize(mode, locations, start_id, end_id)
         except RuntimeError as e:
             self._send_json(502, {"error": str(e)})
             return
 
-        self._send_json(200, {
-            "mode": mode,
-            "order": order,
-            "total_distance_km": total_distance_km,
-            "total_duration_min": total_duration_min,
-        })
+        self._send_json(200, result)
